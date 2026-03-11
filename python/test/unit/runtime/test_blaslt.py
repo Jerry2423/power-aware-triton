@@ -203,3 +203,162 @@ def test_block_scaled_matmul_nvfp4(m, n, k, device):
     ref = torch.matmul(a_ref.to(torch.float32) * a_scale_ref, b_ref.to(torch.float32).T * b_scale_ref)
 
     torch.testing.assert_close(output.to(torch.float32), ref, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("m, n, k", [(256, 256, 256), (512, 512, 512), (1024, 1024, 1024)])
+@pytest.mark.parametrize("dtype_str", ["float16", "float32"])
+def test_get_algorithms(m, n, k, dtype_str, device):
+    """Test that get_algorithms returns a non-empty list of algorithm details."""
+    if not is_cuda():
+        pytest.skip("get_algorithms is only supported on CUDA")
+
+    from triton._C.libtriton import nvidia
+
+    workspace_size = 32 * 1024 * 1024
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    handle = nvidia.cublas.CublasLt(workspace)
+
+    algos = handle.get_algorithms(m, n, k, dtype_str)
+
+    assert len(algos) > 0, "Expected at least one algorithm"
+
+    # Verify structure of each algorithm info dict
+    for algo in algos:
+        assert "index" in algo
+        assert "workspace_size" in algo
+        assert "waves_count" in algo
+        assert "tile_id" in algo
+        assert "tile_name" in algo
+        assert "stages_id" in algo
+        assert "splitk_num" in algo
+        assert "reduction_scheme" in algo
+        assert "cta_swizzling" in algo
+        assert "custom_option" in algo
+        assert "custom_option_max" in algo
+        assert "supported_tiles" in algo
+        assert "supported_stages" in algo
+
+    # Verify that tile expansion produces algos with diverse tile configs
+    tile_names = set(algo['tile_name'] for algo in algos)
+    print(f"\n  Problem: {m}x{n}x{k} ({dtype_str})")
+    print(f"  Found {len(algos)} algorithms with {len(tile_names)} distinct tiles: {sorted(tile_names)}")
+    for algo in algos[:5]:  # Print first 5
+        print(f"    [{algo['index']}] tile={algo['tile_name']}, "
+              f"stages={algo['stages_id']}, "
+              f"waves={algo['waves_count']:.2f}, "
+              f"workspace={algo['workspace_size']}")
+    # With tile expansion we expect more than one distinct tile (for non-trivial sizes)
+    if m >= 256 and n >= 256:
+        assert len(tile_names) > 1, (
+            f"Expected diverse tile configs from expansion, got only {tile_names}")
+
+
+@pytest.mark.parametrize("m, n, k", [(256, 256, 256), (512, 512, 512)])
+@pytest.mark.parametrize("dtype_str", ["float16", "float32"])
+def test_matmul_with_algo(m, n, k, dtype_str, device):
+    """Test matmul_with_algo produces correct results for multiple algorithm indices."""
+    if not is_cuda():
+        pytest.skip("matmul_with_algo is only supported on CUDA")
+
+    from triton._C.libtriton import nvidia
+
+    dtype = getattr(torch, dtype_str)
+    torch.manual_seed(123)
+
+    workspace_size = 32 * 1024 * 1024
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    handle = nvidia.cublas.CublasLt(workspace)
+
+    # First query available algorithms
+    algos = handle.get_algorithms(m, n, k, dtype_str)
+    assert len(algos) > 0
+
+    # Use small integer values to avoid accumulation errors
+    def limited_rand(shape):
+        elements = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=torch.float32, device=device)
+        total_elems = torch.prod(torch.tensor(shape)).item()
+        indices = torch.randint(0, len(elements), (total_elems,), device=device)
+        return elements[indices].view(shape)
+
+    a = limited_rand((m, k)).to(dtype)
+    b = limited_rand((k, n)).to(dtype)
+
+    # B must be transposed (N, K) layout, same as matmul
+    b_t = b.T.contiguous()
+
+    # Reference: standard matmul
+    ref = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(dtype)
+
+    # Test algorithms. Not all algorithms are guaranteed to succeed at runtime
+    # — even those passing cublasLtMatmulAlgoCheck() may fail with
+    # CUBLAS_STATUS_NOT_SUPPORTED due to alignment or hardware constraints.
+    # We require at least one algorithm to work.
+    num_to_test = min(5, len(algos))
+    num_passed = 0
+    for i in range(num_to_test):
+        c = torch.zeros((m, n), dtype=dtype, device=device)
+        try:
+            handle.matmul_with_algo(a, b_t, c, i)
+        except RuntimeError as e:
+            print(f"\n  algo[{i}] tile={algos[i]['tile_name']}, "
+                  f"stages={algos[i]['stages_id']} => SKIPPED ({e})")
+            continue
+
+        torch.testing.assert_close(c.to(torch.float32), ref.to(torch.float32), atol=2.0, rtol=1e-2)
+        num_passed += 1
+        print(f"\n  algo[{i}] tile={algos[i]['tile_name']}, "
+              f"stages={algos[i]['stages_id']} => PASS")
+
+    assert num_passed > 0, (
+        f"All {num_to_test} tested algorithms failed at runtime")
+
+
+@pytest.mark.parametrize("dtype_str", ["float16"])
+def test_matmul_with_algo_requires_get_algorithms(dtype_str, device):
+    """Test that matmul_with_algo raises an error if get_algorithms was not called first."""
+    if not is_cuda():
+        pytest.skip("matmul_with_algo is only supported on CUDA")
+
+    from triton._C.libtriton import nvidia
+
+    dtype = getattr(torch, dtype_str)
+    m, n, k = 256, 256, 256
+
+    workspace_size = 32 * 1024 * 1024
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    handle = nvidia.cublas.CublasLt(workspace)
+
+    a = torch.randn((m, k), dtype=dtype, device=device)
+    b_t = torch.randn((n, k), dtype=dtype, device=device)
+    c = torch.zeros((m, n), dtype=dtype, device=device)
+
+    # Should fail: no prior get_algorithms() call
+    with pytest.raises(RuntimeError, match="No cached algorithms"):
+        handle.matmul_with_algo(a, b_t, c, 0)
+
+
+@pytest.mark.parametrize("dtype_str", ["float16"])
+def test_matmul_with_algo_stale_cache(dtype_str, device):
+    """Test that matmul_with_algo raises an error if problem params changed since get_algorithms."""
+    if not is_cuda():
+        pytest.skip("matmul_with_algo is only supported on CUDA")
+
+    from triton._C.libtriton import nvidia
+
+    dtype = getattr(torch, dtype_str)
+
+    workspace_size = 32 * 1024 * 1024
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    handle = nvidia.cublas.CublasLt(workspace)
+
+    # Cache algos for 256x256x256
+    algos = handle.get_algorithms(256, 256, 256, dtype_str)
+    assert len(algos) > 0
+
+    # Now try to use cached algos with a different problem size
+    a = torch.randn((512, 512), dtype=dtype, device=device)
+    b_t = torch.randn((512, 512), dtype=dtype, device=device)
+    c = torch.zeros((512, 512), dtype=dtype, device=device)
+
+    with pytest.raises(RuntimeError, match="do not match cached algorithms"):
+        handle.matmul_with_algo(a, b_t, c, 0)

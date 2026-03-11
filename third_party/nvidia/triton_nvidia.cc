@@ -411,6 +411,147 @@ void init_triton_nvidia(py::module &&m) {
              self.gemm(A_shape[0], B_shape[0], A_shape[1], A_ptr, B_ptr, C_ptr,
                        D_ptr, dtype, alpha, beta);
            })
+      .def("get_algorithms",
+           [](CublasLtInstance &self, int m, int n, int k,
+              std::string dtype_str) {
+             cudaDataType_t dtype;
+             if (dtype_str == "float8_e4m3fn") {
+               dtype = CUDA_R_8F_E4M3;
+             } else if (dtype_str == "float16") {
+               dtype = CUDA_R_16F;
+             } else if (dtype_str == "float32") {
+               dtype = CUDA_R_32F;
+             } else if (dtype_str == "bfloat16") {
+               dtype = CUDA_R_16BF;
+             } else {
+               throw std::runtime_error(
+                   "Unsupported dtype for get_algorithms: " + dtype_str);
+             }
+
+             auto algos = self.get_algorithms(m, n, k, dtype);
+
+             py::list result;
+             for (const auto &algo : algos) {
+               py::dict d;
+               d["index"] = algo.index;
+               d["workspace_size"] = algo.workspace_size;
+               d["waves_count"] = algo.waves_count;
+               d["tile_id"] = algo.tile_id;
+               d["tile_name"] = algo.tile_name;
+               d["stages_id"] = algo.stages_id;
+               d["splitk_num"] = algo.splitk_num;
+               d["reduction_scheme"] = algo.reduction_scheme;
+               d["cta_swizzling"] = algo.cta_swizzling;
+               d["custom_option"] = algo.custom_option;
+               d["custom_option_max"] = algo.custom_option_max;
+
+               py::list tiles;
+               for (const auto &t : algo.supported_tiles)
+                 tiles.append(t);
+               d["supported_tiles"] = tiles;
+
+               py::list stages;
+               for (auto s : algo.supported_stages)
+                 stages.append(s);
+               d["supported_stages"] = stages;
+
+               result.append(d);
+             }
+             return result;
+           })
+      .def("matmul_with_algo",
+           [](CublasLtInstance &self, py::object &A, py::object &B,
+              py::object &C, int algo_index) {
+             auto A_ptr = A.attr("data_ptr")().cast<uint64_t>();
+             auto B_ptr = B.attr("data_ptr")().cast<uint64_t>();
+             auto C_ptr = C.attr("data_ptr")().cast<uint64_t>();
+
+             auto A_shape = A.attr("shape").cast<std::vector<int>>();
+             auto B_shape = B.attr("shape").cast<std::vector<int>>();
+             auto C_shape = C.attr("shape").cast<std::vector<int>>();
+
+             auto A_dtype =
+                 A.attr("dtype").attr("__str__")().cast<std::string>();
+             auto B_dtype =
+                 B.attr("dtype").attr("__str__")().cast<std::string>();
+             auto C_dtype =
+                 C.attr("dtype").attr("__str__")().cast<std::string>();
+
+             checkMatmulConstraints(A_dtype, B_dtype, C_dtype, A_shape, B_shape,
+                                    C_shape);
+
+             std::string dtype_str =
+                 A_dtype.substr(A_dtype.find_last_of('.') + 1);
+             cudaDataType_t dtype;
+             if (dtype_str == "float8_e4m3fn") {
+               dtype = CUDA_R_8F_E4M3;
+             } else if (dtype_str == "float16") {
+               dtype = CUDA_R_16F;
+             } else if (dtype_str == "float32") {
+               dtype = CUDA_R_32F;
+             } else if (dtype_str == "bfloat16") {
+               dtype = CUDA_R_16BF;
+             } else {
+               throw std::runtime_error(
+                   "Unsupported dtype for matmul_with_algo: " + dtype_str);
+             }
+
+             self.matmul_with_algo(A_shape[0], B_shape[0], A_shape[1], A_ptr,
+                                   B_ptr, C_ptr, dtype, algo_index);
+           })
+      .def("gemm_with_algo",
+           [](CublasLtInstance &self, py::object &A, py::object &B,
+              py::object &C, py::object &D, float alpha, float beta,
+              int algo_index) {
+             auto A_ptr = A.attr("data_ptr")().cast<uint64_t>();
+             auto B_ptr = B.attr("data_ptr")().cast<uint64_t>();
+             auto C_ptr = C.attr("data_ptr")().cast<uint64_t>();
+             auto D_ptr = D.attr("data_ptr")().cast<uint64_t>();
+
+             auto A_shape = A.attr("shape").cast<std::vector<int>>();
+             auto B_shape = B.attr("shape").cast<std::vector<int>>();
+             auto C_shape = C.attr("shape").cast<std::vector<int>>();
+             auto D_shape = D.attr("shape").cast<std::vector<int>>();
+
+             auto A_dtype =
+                 A.attr("dtype").attr("__str__")().cast<std::string>();
+             auto B_dtype =
+                 B.attr("dtype").attr("__str__")().cast<std::string>();
+             auto C_dtype =
+                 C.attr("dtype").attr("__str__")().cast<std::string>();
+             auto D_dtype =
+                 D.attr("dtype").attr("__str__")().cast<std::string>();
+
+             checkMatmulConstraints(A_dtype, B_dtype, D_dtype, A_shape, B_shape,
+                                    D_shape);
+             if (C_dtype != "torch.float16") {
+               throw std::runtime_error("C dtype must be float16, got " +
+                                        C_dtype);
+             }
+             if (C_shape != D_shape) {
+               throw std::runtime_error("C and D shapes must match");
+             }
+
+             std::string dtype_str =
+                 A_dtype.substr(A_dtype.find_last_of('.') + 1);
+             cudaDataType_t dtype;
+             if (dtype_str == "float8_e4m3fn") {
+               dtype = CUDA_R_8F_E4M3;
+             } else if (dtype_str == "float16") {
+               dtype = CUDA_R_16F;
+             } else if (dtype_str == "float32") {
+               dtype = CUDA_R_32F;
+             } else if (dtype_str == "bfloat16") {
+               dtype = CUDA_R_16BF;
+             } else {
+               throw std::runtime_error(
+                   "Unsupported dtype for gemm_with_algo: " + dtype_str);
+             }
+
+             self.gemm_with_algo(A_shape[0], B_shape[0], A_shape[1], A_ptr,
+                                 B_ptr, C_ptr, D_ptr, dtype, alpha, beta,
+                                 algo_index);
+           })
       .def("block_scaled_matmul_mxfp8",
            [](CublasLtInstance &self, py::object &A, py::object &B,
               py::object &output, py::object &scale_A, py::object &scale_B) {
